@@ -26,7 +26,7 @@ PREFIX="$WORK/prefix"
 SRC="$WORK/src"
 IOS_FLAGS=(-DCMAKE_SYSTEM_NAME=$SYSNAME -DCMAKE_OSX_DEPLOYMENT_TARGET=$DEPTGT
            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release
-           "${SYSROOT_FLAG[@]}"
+           ${SYSROOT_FLAG[@]+"${SYSROOT_FLAG[@]}"}  # bash 3.2: empty array under set -u is an error
            -DBUILD_SHARED_LIBS=OFF "-DCMAKE_INSTALL_PREFIX=$PREFIX"
            "-DCMAKE_PREFIX_PATH=$PREFIX"
            "-DCMAKE_FIND_ROOT_PATH=$PREFIX"
@@ -77,7 +77,7 @@ for lib in libogg libvorbis libvorbisfile libvorbisenc libopus libopusfile libpn
     f="$PREFIX/lib/$lib.a"
     [[ -f "$f" ]] || { echo "FATAL: missing $f" >&2; exit 1; }
     lipo -info "$f" | grep -q arm64 || { echo "FATAL: $f not arm64" >&2; exit 1; }
-    plat=$(otool -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/platform/{print $2; exit}')
+    plat=$(otool -l "$f" 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/platform/&&!p{print $2; p=1}')
     [[ "$plat" =~ ^($WANT)$ ]] || { echo "FATAL: $f platform=$plat, expected $WANT" >&2; exit 1; }
 done
 echo "audio deps OK ($SDK): $PREFIX"

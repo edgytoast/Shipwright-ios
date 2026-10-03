@@ -1,0 +1,6 @@
+# Overlay patches are byte-exact inputs to patch --fuzz=0. Two of them (0006,
+# 0007) carry CRLF hunks because upstream stores the ZAPDTR/OTRExporter
+# CMakeLists.txt files with CRLF; a core.autocrlf checkout that strips the CRs
+# makes them unappliable (GitHub issue #1, part 3). Never convert them.
+overlay/patches/*.patch -text
+overlay/assets/*.patch -text

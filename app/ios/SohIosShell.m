@@ -19,6 +19,13 @@ UIView* SohIos_FindMetalView(UIWindow* w);
 void SohIos_GlueWindowToScene(UIWindow* w, UIWindowScene* scene);
 void SohIos_ForceViewChainAdopt(void);
 static UIWindow* SohIos_GameWindowWithMetal(UIView** outMv);
+#if !TARGET_OS_VISION
+// iOS 27 / LiveContainer landscape + game-view self-heal (defined near
+// SohIos_EnsureLandscape; called from the scene delegate and the 0.25 s tick).
+static void SohIos_HealOrientation(const char* why);
+static BOOL SohIos_ReconcileGameView(const char* why, BOOL force);
+static void SohIos_OrientationTick(void);
+#endif
 #if TARGET_OS_VISION
 extern volatile float gSohIosVisionLongEdge;
 // R10 verdict 5: the Sense pair's flat-mode pump reads through this. Only the
@@ -3424,11 +3431,38 @@ static UISceneConfiguration* SohIos_SceneConfigForSession(id self, SEL _cmd, UIA
 - (void)sceneWillEnterForeground:(UIScene*)scene {
     SohIos_SetBackgrounded(0);
     [self fwd:@selector(applicationWillEnterForeground:)];
+#if !TARGET_OS_VISION
+    SohIos_HealOrientation("sceneWillEnterForeground");
+#endif
 }
 - (void)sceneDidBecomeActive:(UIScene*)scene {
     SohIos_SetBackgrounded(0); // belt-and-braces on every activation path
     [self fwd:@selector(applicationDidBecomeActive:)];
+#if !TARGET_OS_VISION
+    // iOS 27: every activation (Home-and-return, Notification/Control Center
+    // dismissed) used to leave the game stretched -- SDL read the no-op
+    // statusBarOrientation (fixed at the source by overlay 0059). Re-assert
+    // landscape and re-derive the game view's size here as the backstop.
+    SohIos_HealOrientation("sceneDidBecomeActive");
+#endif
 }
+#if !TARGET_OS_VISION
+// Rotation / geometry change. Under LiveContainer the host process's plist
+// allows portrait, so FrontBoard can hand this landscape-only app a portrait
+// scene (launch upright, or turning the phone upright) -- the old one-shot
+// landscape request could not undo that. Both selectors: iOS 26 added the
+// effective-geometry callback and deprecates the coordinate-space one.
+- (void)windowScene:(UIWindowScene*)windowScene
+    didUpdateCoordinateSpace:(id<UICoordinateSpace>)previousCoordinateSpace
+        interfaceOrientation:(UIInterfaceOrientation)previousInterfaceOrientation
+             traitCollection:(UITraitCollection*)previousTraitCollection {
+    SohIos_HealOrientation("didUpdateCoordinateSpace");
+}
+- (void)windowScene:(UIWindowScene*)windowScene
+    didUpdateEffectiveGeometry:(UIWindowSceneGeometry*)previousEffectiveGeometry API_AVAILABLE(ios(26.0)) {
+    SohIos_HealOrientation("didUpdateEffectiveGeometry");
+}
+#endif
 - (NSUserActivity*)stateRestorationActivityForScene:(UIScene*)scene {
     return nil; // engine re-boots fresh each launch (predecessor lesson)
 }
@@ -3856,6 +3890,15 @@ int SohIos_GeomReport(char* buf, int cap) {
              sb.size.width, sb.size.height, wf.origin.x, wf.origin.y, wf.size.width, wf.size.height,
              mf.origin.x, mf.origin.y, mf.size.width, mf.size.height, ds.width, ds.height, (float)cs,
              gSoh3DDbg2DW, gSoh3DDbg2DH, gSoh3DMode);
+#if !TARGET_OS_VISION
+    {
+        size_t used = strlen(buf);
+        if (used < (size_t)cap) {
+            snprintf(buf + used, cap - used, " orient=%ld",
+                     (long)(scene ? scene.interfaceOrientation : UIInterfaceOrientationUnknown));
+        }
+    }
+#endif
     return 1;
 }
 
@@ -3912,6 +3955,12 @@ void SohIos_RestoreWindowTo(CGSize target) {
             gSohIosContentsScale = mv.layer.contentsScale;
         }
     }
+#if !TARGET_OS_VISION
+    // iPhone/iPad counterpart of the visionOS self-heal below, lighter: the
+    // scene is not user-resizable here, so only orientation and a stale view
+    // chain can go wrong (iOS 27 / LiveContainer).
+    SohIos_OrientationTick();
+#endif
 #if TARGET_OS_VISION
     {
         // Self-healing drawable: the SDL metal view's resize DEBOUNCE can lose
@@ -5245,6 +5294,7 @@ static void SohIos_EnsureLandscape(UIWindow* window, int attempt) {
         window.windowScene = scene;
     }
     SohIos_GlueWindowToScene(window, scene);
+#if TARGET_OS_VISION
     UIInterfaceOrientation o = scene.interfaceOrientation;
     if (o == UIInterfaceOrientationLandscapeLeft || o == UIInterfaceOrientationLandscapeRight) {
         return; // already landscape
@@ -5257,7 +5307,277 @@ static void SohIos_EnsureLandscape(UIWindow* window, int attempt) {
         }];
         [window.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
     }
+#else
+    // iOS: no longer one-shot -- see the self-heal below.
+    SohIos_HealOrientation("window-created");
+#endif
 }
+
+#if !TARGET_OS_VISION
+// ---------------------------------------------------------------------------
+// iOS 27 / LiveContainer: landscape and game-view size are SELF-HEALING.
+// ---------------------------------------------------------------------------
+// Two failure families, both new with the iOS 27 SDK build (DECISIONS D-077):
+//  1. statusBarOrientation became a no-op, and SDL flipped its display mode
+//     to portrait on each activation (fixed in SDL by overlay 0059; this is
+//     the backstop that re-derives the view chain after every activation).
+//  2. Inside LiveContainer the scene is negotiated with LiveContainer's own
+//     Info.plist (portrait allowed), so the scene can connect or rotate
+//     portrait. A landscape request then lands a moment later, mid-layout,
+//     and SDL's view came out 1472x0 with nothing ever re-laying it out.
+// Rule: portrait bounds are never final. While the scene is portrait-shaped,
+// re-assert landscape (bounded: every 0.5 s for 3 s, polled at 100 ms), and
+// after every geometry change glue window -> scene and force SDL's view chain
+// to match, so the metal view re-derives drawableSize and SDL's view
+// controller reports RESIZED. If the system refuses landscape for good, the
+// game still renders unstretched into whatever the scene really is.
+static BOOL SohIos_SceneIsLandscape(UIWindowScene* s) {
+    if (s == nil) {
+        return NO;
+    }
+    UIInterfaceOrientation o = s.interfaceOrientation;
+    CGSize b = s.coordinateSpace.bounds.size;
+    BOOL oLand = (o == UIInterfaceOrientationLandscapeLeft || o == UIInterfaceOrientationLandscapeRight);
+    return oLand && b.width >= b.height;
+}
+
+static void SohIos_RequestLandscape(UIWindowScene* scene, UIWindow* w) {
+    if (@available(iOS 16.0, *)) {
+        UIWindowSceneGeometryPreferencesIOS* prefs = [[UIWindowSceneGeometryPreferencesIOS alloc]
+            initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+        [scene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError* e) {
+            NSLog(@"[SohIosShell] landscape request failed: %@", e);
+        }];
+        [w.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+    }
+}
+
+// SDL's LOGICAL window size vs. the root view controller's view bounds (GitHub
+// issue #1, part 2 -- the stretched-portrait resume). SDL's own invariant is
+// window size == its view controller's view bounds, which viewDidLayoutSubviews
+// maintains. Two things break it without any view change, so UIKit runs no
+// layout pass and nothing corrects it: (a) on every re-activation
+// SDL_OnApplicationDidBecomeActive sends SDL_WINDOWEVENT_RESTORED, and for our
+// FULLSCREEN window (LUS gameMode) SDL_UpdateFullscreenMode re-sends RESIZED
+// with the display mode -- portrait 440x956 when statusBarOrientation lies (the
+// iOS 27 no-op; overlay 0059 fixes the mode source, this is the belt to its
+// braces); (b) the menu's Toggle Fullscreen re-applies the same mode. LUS
+// sizes ImGui and the game from SDL_GetWindowSize, so a wrong size here IS the
+// stretch. Returns YES when the two disagree; fills the view size.
+static BOOL SohIos_SdlWindowSizeOff(UIWindow* w, int* outVw, int* outVh) {
+    if (gSdlWindow == NULL || w == nil || w.rootViewController == nil) {
+        return NO;
+    }
+    CGSize rb = w.rootViewController.view.bounds.size;
+    int vw = (int)rb.width, vh = (int)rb.height;
+    if (vw <= 1 || vh <= 1) {
+        return NO;
+    }
+    int sw = 0, sh = 0;
+    SDL_GetWindowSize(gSdlWindow, &sw, &sh);
+    if (outVw) {
+        *outVw = vw;
+    }
+    if (outVh) {
+        *outVh = vh;
+    }
+    return sw != vw || sh != vh;
+}
+
+// Glue the game window to its scene and make SDL's whole view chain match
+// it. SDL sets child frames explicitly (no autoresizing), so every ancestor
+// of the metal view is set, then layout runs: the metal view re-derives its
+// drawableSize (layoutSubviews) and SDL's view controller reports RESIZED
+// (viewDidLayoutSubviews). Returns YES if it had to fix something.
+static BOOL SohIos_ReconcileGameView(const char* why, BOOL force) {
+    UIView* mv = nil;
+    UIWindow* w = SohIos_GameWindowWithMetal(&mv);
+    if (w == nil || mv == nil) {
+        return NO;
+    }
+    int sdlVw = 0, sdlVh = 0;
+    BOOL sdlOff = SohIos_SdlWindowSizeOff(w, &sdlVw, &sdlVh);
+    UIWindowScene* scene = w.windowScene;
+    if (scene != nil) {
+        SohIos_GlueWindowToScene(w, scene);
+    }
+    CGSize wb = w.bounds.size;
+    if (wb.width < 1 || wb.height < 1) {
+        return NO;
+    }
+    CGSize vb = mv.bounds.size;
+    CGSize ds = ((CAMetalLayer*)mv.layer).drawableSize;
+    const float wAspect = wb.width / wb.height;
+    BOOL viewOff = vb.width < 1 || vb.height < 1 || fabs(vb.width - wb.width) > 1 || fabs(vb.height - wb.height) > 1;
+    BOOL drawOff = ds.width < 1 || ds.height < 1 || fabsf((float)(ds.width / ds.height) - wAspect) > wAspect * 0.02f;
+    // Engine 2D dims (overlay 0031 telemetry): compared by ASPECT so the
+    // check is unit-agnostic. Only meaningful while frames are running.
+    BOOL engineOff = !SohIos_IsBackgrounded() && gSoh3DDbg2DW > 0 && gSoh3DDbg2DH > 0 &&
+                     fabsf((float)gSoh3DDbg2DW / (float)gSoh3DDbg2DH - wAspect) > wAspect * 0.05f;
+    if (!force && !viewOff && !drawOff && !engineOff && !sdlOff) {
+        return NO;
+    }
+    if (viewOff || drawOff || engineOff || sdlOff) {
+        int sw = 0, sh = 0;
+        if (gSdlWindow != NULL) {
+            SDL_GetWindowSize(gSdlWindow, &sw, &sh);
+        }
+        NSLog(@"[SohIosShell] reconcile (%s): scene orient=%ld win %.0fx%.0f view %.0fx%.0f drawable %.0fx%.0f "
+              @"engine %dx%d sdl %dx%d%s%s%s%s",
+              why, (long)(scene ? scene.interfaceOrientation : 0), wb.width, wb.height, vb.width, vb.height,
+              ds.width, ds.height, gSoh3DDbg2DW, gSoh3DDbg2DH, sw, sh, viewOff ? " VIEW" : "",
+              drawOff ? " DRAWABLE" : "", engineOff ? " ENGINE" : "", sdlOff ? " SDL" : "");
+    }
+    for (UIView* v = mv; v != nil && v != (UIView*)w; v = v.superview) {
+        if (!CGRectEqualToRect(v.frame, w.bounds)) {
+            v.frame = w.bounds;
+        }
+    }
+    UIView* root = w.rootViewController.view;
+    [root setNeedsLayout];
+    [root layoutIfNeeded];
+    [mv setNeedsLayout];
+    [mv layoutIfNeeded];
+    if (sdlOff && SohIos_SdlWindowSizeOff(w, NULL, NULL)) {
+        // UIKit skipped the pass (nothing about the view changed). SDL's
+        // viewDidLayoutSubviews only reads view.bounds and sends
+        // SDL_WINDOWEVENT_RESIZED -- call it directly.
+        [w.rootViewController viewDidLayoutSubviews];
+        int sw = 0, sh = 0;
+        SDL_GetWindowSize(gSdlWindow, &sw, &sh);
+        NSLog(@"[SohIosShell] reconcile (%s): re-reported view %dx%d to SDL directly -> sdl %dx%d", why, sdlVw,
+              sdlVh, sw, sh);
+    }
+    return viewOff || drawOff || engineOff || sdlOff;
+}
+
+// Bounded landscape re-assertion. One chain at a time (generation counter);
+// a new heal restarts the budget.
+static int gSohHealGen = 0;
+static int gSohHealActive = 0;
+static UIInterfaceOrientation gSohHealSettledOrient = UIInterfaceOrientationUnknown;
+enum { kSohHealPollMs = 100, kSohHealReaskEvery = 5, kSohHealMaxTicks = 30 };
+
+static void SohIos_HealStep(int gen, int tick, const char* why) {
+    if (gen != gSohHealGen) {
+        return; // superseded
+    }
+    UIView* mv = nil;
+    UIWindow* w = SohIos_GameWindowWithMetal(&mv);
+    UIWindowScene* scene = w ? w.windowScene : SohIos_ActiveScene();
+    if (scene == nil || w == nil) {
+        if (tick < kSohHealMaxTicks) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kSohHealPollMs * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ SohIos_HealStep(gen, tick + 1, why); });
+        } else {
+            gSohHealActive = 0;
+        }
+        return;
+    }
+    if (SohIos_SceneIsLandscape(scene)) {
+        // LiveContainer's per-app Orientation Lock (TweakLoader
+        // UIKit+GuestHooks.m, LC 4dbe0f9) FORGES the in-process scene
+        // settings to landscapeRight while FrontBoard's real scene can still
+        // be portrait -- the scene then reports 956x440 landscape and the
+        // game draws unrotated into the top of a portrait display. From the
+        // inside that is indistinguishable from a real landscape scene, so on
+        // lifecycle heals (not geometry callbacks: no feedback loop) ask
+        // FrontBoard for landscape anyway. A no-op when it already is.
+        if (tick == 0 && strcmp(why, "didUpdateCoordinateSpace") != 0 && strcmp(why, "didUpdateEffectiveGeometry") != 0 &&
+            strcmp(why, "tick") != 0) {
+            SohIos_RequestLandscape(scene, w);
+        }
+        SohIos_ReconcileGameView(why, tick > 0); // after a rotation: always re-layout once
+        if (tick > 0) {
+            NSLog(@"[SohIosShell] landscape settled (%s) after %d ms: scene %.0fx%.0f orient=%ld", why,
+                  tick * kSohHealPollMs, scene.coordinateSpace.bounds.size.width,
+                  scene.coordinateSpace.bounds.size.height, (long)scene.interfaceOrientation);
+        }
+        gSohHealSettledOrient = scene.interfaceOrientation;
+        gSohHealActive = 0;
+        return;
+    }
+    // Portrait (or portrait-shaped) scene. Keep the game unstretched in the
+    // meantime, and keep asking for landscape.
+    SohIos_ReconcileGameView(why, NO);
+    if (tick % kSohHealReaskEvery == 0) {
+        NSLog(@"[SohIosShell] scene not landscape (%s, tick %d): orient=%ld bounds %.0fx%.0f -- requesting landscape",
+              why, tick, (long)scene.interfaceOrientation, scene.coordinateSpace.bounds.size.width,
+              scene.coordinateSpace.bounds.size.height);
+        SohIos_RequestLandscape(scene, w);
+    }
+    if (tick < kSohHealMaxTicks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kSohHealPollMs * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ SohIos_HealStep(gen, tick + 1, why); });
+        return;
+    }
+    NSLog(@"[SohIosShell] landscape NOT granted (%s) after %d ms: orient=%ld bounds %.0fx%.0f -- rendering "
+          @"unstretched into the portrait scene",
+          why, tick * kSohHealPollMs, (long)scene.interfaceOrientation, scene.coordinateSpace.bounds.size.width,
+          scene.coordinateSpace.bounds.size.height);
+    SohIos_ReconcileGameView(why, YES);
+    gSohHealSettledOrient = scene.interfaceOrientation;
+    gSohHealActive = 0;
+}
+
+static void SohIos_HealOrientation(const char* why) {
+    gSohHealGen++;
+    gSohHealActive = 1;
+    int gen = gSohHealGen;
+    // Run on the next main-queue turn: callers include scene callbacks that
+    // fire mid-transaction, before SDL's views have been laid out.
+    dispatch_async(dispatch_get_main_queue(), ^{ SohIos_HealStep(gen, 0, why); });
+}
+
+// 0.25 s overlay tick (iPhone path). Cheap when healthy: one size compare.
+static void SohIos_OrientationTick(void) {
+    if (gSohHealActive || SohIos_IsBackgrounded()) {
+        return;
+    }
+    UIWindow* w = SohIos_GameWindowWithMetal(NULL);
+    UIWindowScene* scene = w.windowScene;
+    if (scene == nil) {
+        return;
+    }
+    // A portrait scene we have not already given up on (the orientation
+    // changed since the last settle): start a heal. A scene the system keeps
+    // portrait (e.g. LiveContainer's per-app lock) is not re-asked forever.
+    if (!SohIos_SceneIsLandscape(scene) && scene.interfaceOrientation != gSohHealSettledOrient) {
+        SohIos_HealOrientation("tick");
+        return;
+    }
+    // Stale view chain / drawable / engine size: two consecutive ticks
+    // (0.5 s) before acting, so a rotation in flight is not interrupted.
+    static int staleTicks = 0;
+    static int missStreak = 0;
+    UIView* mv = SohIos_FindMetalView(w);
+    if (mv == nil) {
+        return;
+    }
+    CGSize wb = w.bounds.size, vb = mv.bounds.size;
+    CGSize ds = ((CAMetalLayer*)mv.layer).drawableSize;
+    float wAspect = wb.height > 0 ? (float)(wb.width / wb.height) : 0;
+    BOOL off = wAspect > 0 &&
+               (vb.height < 1 || fabs(vb.width - wb.width) > 1 || fabs(vb.height - wb.height) > 1 || ds.height < 1 ||
+                fabsf((float)(ds.width / ds.height) - wAspect) > wAspect * 0.02f ||
+                (gSoh3DDbg2DH > 0 && fabsf((float)gSoh3DDbg2DW / (float)gSoh3DDbg2DH - wAspect) > wAspect * 0.05f));
+    off = off || SohIos_SdlWindowSizeOff(w, NULL, NULL);
+    if (!off) {
+        staleTicks = 0;
+        missStreak = 0;
+        return;
+    }
+    // Back off if reconciling does not take (never spin the layout pass or
+    // the log at 4 Hz forever): after 8 straight misses, every 5 s.
+    if (++staleTicks >= 2) {
+        staleTicks = 0;
+        if (missStreak < 8 || (missStreak % 10) == 0) {
+            SohIos_ReconcileGameView("tick", YES);
+        }
+        missStreak++;
+    }
+}
+#endif
 
 // Region probe for the bridge `stickregion` command. MAIN THREAD ONLY.
 // Returns 1/0 for in/out of the stick spawn region, -2 if no overlay found.

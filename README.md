@@ -166,6 +166,18 @@ Attach those to a [GitHub issue](../../issues) or send them over Discord, along 
 you were doing and whether a texture pack was installed. A crash without `crash.txt` is
 usually the app being killed for memory — worth saying so, and which area you were in.
 
+**Running inside LiveContainer?** It works — the app keeps itself in landscape
+and re-sizes itself after rotations, Home, and Notification/Control Center (from the
+version after 1.1.1; 1.1.1 itself can go stretched or black there). Our testing:
+
+- Leave LiveContainer's per-app **Orientation Lock** **off** — the app forces
+  landscape by itself. *Landscape* also works; the status-bar clock may stay drawn
+  over the game until you first rotate the phone.
+- Don't use LiveContainer's **Multitask** mode for this app (untested; it is a
+  fullscreen game).
+- On iPad, turn on LiveContainer's **Compatibility Mode** for the app (not yet
+  tested on iPad).
+
 ---
 
 ## Building from source
