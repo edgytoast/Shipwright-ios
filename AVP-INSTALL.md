@@ -58,3 +58,7 @@ Upstream Shipwright is vendored unmodified and pinned by commit. Every local cha
 - Apps sideloaded with a free Apple account expire after 7 days (paid developer accounts last a year). SideStore refreshes them in the background; if the app stops launching, open SideStore and let it re-sign.
 - If the app crashes, it writes `crash.txt` and a `logs/` folder to *On My Apple Vision Pro → Ship of Harkinian* in Files. Attach them to a [GitHub issue](https://github.com/rebelancap/Shipwright-ios/issues).
 - THE LEGEND OF ZELDA: OCARINA OF TIME is © Nintendo. This project is not affiliated with or endorsed by Nintendo, and ships no Nintendo content.
+
+## Support
+
+This fork keeps The Legend of Zelda: Ocarina of Time installable on Apple Vision Pro. It's maintained as part of the [AVP Ports Index](https://github.com/edgytoast/avp-ports-index), which tracks every port we can find and runs a safety check on each one. If this guide got you playing, you can [buy me a coffee](https://buymeacoffee.com/adminpz) to help keep it running.
